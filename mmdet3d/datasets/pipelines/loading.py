@@ -55,6 +55,54 @@ class PointToMultiViewDepth(object):
         results['img_inputs'] = (imgs, rots, trans, intrins, post_rots, post_trans, depth_map)
         return results
 
+@PIPELINES.register_module()
+class PointToMultiViewHeight(object):
+    def __init__(self, grid_config, downsample=16):
+        self.downsample = downsample
+        self.grid_config=grid_config
+
+    def points2heightmap(self, points, points_img_height, height, width, canvas=None):
+        height, width = height//self.downsample, width//self.downsample
+        height_map = torch.zeros((height,width), dtype=torch.float32)
+        coor = torch.round(points[:,:2]/self.downsample)
+        depth = points[:,2]
+        kept1 = (coor[:, 0] >= 0) & (coor[:, 0] < width) \
+               & (coor[:, 1] >= 0) & (coor[:, 1] < height) \
+                & (depth < self.grid_config['dbound'][1]) \
+                & (depth >= self.grid_config['dbound'][0])
+        coor, depth, points_img_height = coor[kept1], depth[kept1], points_img_height[kept1]
+        ranks = coor[:, 0] + coor[:, 1] * width
+        sort = (ranks+depth/100.).argsort()
+        coor, depth, points_img_height, ranks = coor[sort], depth[sort], points_img_height[sort], ranks[sort]
+
+        kept2 = torch.ones(coor.shape[0], device=coor.device, dtype=torch.bool)
+        kept2[1:] = (ranks[1:] != ranks[:-1])
+        coor, depth, points_img_height = coor[kept2], depth[kept2], points_img_height[kept2]
+        coor = coor.to(torch.long)
+        height_map[coor[:,1],coor[:,0]] = points_img_height
+        return height_map
+
+    def __call__(self, results):
+        points_lidar = results['points']
+        # kept = (points_lidar[:,2] < self.grid_config['zbound'][1]) \
+        #       & (points_lidar[:,2] >= self.grid_config['zbound'][0])
+        # points_lidar = points_lidar[kept]
+        imgs, rots, trans, intrins, post_rots, post_trans = results['img_inputs']
+        height_map_list = []
+        for cid in range(rots.shape[0]):
+            combine = rots[cid].matmul(torch.inverse(intrins[cid]))
+            combine_inv = torch.inverse(combine)
+            points_img = (points_lidar.tensor[:,:3] - trans[cid:cid+1,:]).matmul(combine_inv.T)
+            points_img = torch.cat([points_img[:,:2]/points_img[:,2:3],
+                                   points_img[:,2:3]], 1)
+            points_img_height = points_img[:,1:2]
+            points_img = points_img.matmul(post_rots[cid].T)+post_trans[cid:cid+1,:]
+            height_map = self.points2heightmap(points_img, points_img_height, imgs.shape[2], imgs.shape[3])
+            height_map_list.append(height_map)
+        height_map = torch.stack(height_map_list)
+        results['img_inputs'] = (imgs, rots, trans, intrins, post_rots, post_trans, height_map)
+        return results
+
 
 @PIPELINES.register_module()
 class LoadMultiViewImageFromFiles(object):
@@ -230,7 +278,7 @@ class LoadMultiViewImageFromFiles_BEVDet(object):
             post_rot = torch.eye(2)
             post_tran = torch.zeros(2)
 
-            intrin = torch.Tensor(cam_data['cam_intrinsic'])
+            intrin = torch.Tensor(cam_data['camera_intrinsics'])
             rot = torch.Tensor(cam_data['sensor2lidar_rotation'])
             tran = torch.Tensor(cam_data['sensor2lidar_translation'])
 

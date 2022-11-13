@@ -152,6 +152,8 @@ class RandomFlip3D(RandomFlip):
             aug_transform[0,0] = -1
         aug_transform = aug_transform.view(1,4,4)
         new_transform = aug_transform.matmul(transform)
+        lidar2img = [l2i @ aug_transform.numpy().transpose() for l2i in input_dict['lidar2img']]
+        input_dict['lidar2img'] = lidar2img
         input_dict['img_inputs'][1][...] = new_transform[:,:3,:3]
         input_dict['img_inputs'][2][...] = new_transform[:,:3,-1]
 
@@ -676,6 +678,10 @@ class GlobalRotScaleTrans(object):
         aug_transform[:, -1, -1] = 1.0
 
         new_transform = aug_transform.matmul(transform)
+        lidar2img=[]
+        for cam, l2i in enumerate(input_dict['lidar2img']):
+            lidar2img.append(l2i @ aug_transform[cam].inverse().numpy())
+        input_dict['lidar2img'] = lidar2img
         input_dict['img_inputs'][1][...] = new_transform[:,:3,:3]
         input_dict['img_inputs'][2][...] = new_transform[:,:3,-1]
 
