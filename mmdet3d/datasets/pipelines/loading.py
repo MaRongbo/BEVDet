@@ -1005,3 +1005,293 @@ class LoadAnnotations3D(LoadAnnotations):
         repr_str += f'{indent_str}with_bbox_depth={self.with_bbox_depth}, '
         repr_str += f'{indent_str}poly2mask={self.poly2mask})'
         return repr_str
+
+@PIPELINES.register_module()
+class LoadPlusPointsFromFile(object):
+    """Load Points From File.
+
+    Load points from file.
+
+    Args:
+        coord_type (str): The type of coordinates of points cloud.
+            Available options includes:
+            - 'LIDAR': Points in LiDAR coordinates.
+            - 'DEPTH': Points in depth coordinates, usually for indoor dataset.
+            - 'CAMERA': Points in camera coordinates.
+        load_dim (int, optional): The dimension of the loaded points.
+            Defaults to 6.
+        use_dim (list[int], optional): Which dimensions of the points to use.
+            Defaults to [0, 1, 2]. For KITTI dataset, set use_dim=4
+            or use_dim=[0, 1, 2, 3] to use the intensity dimension.
+        shift_height (bool, optional): Whether to use shifted height.
+            Defaults to False.
+        use_color (bool, optional): Whether to use color features.
+            Defaults to False.
+        file_client_args (dict, optional): Config dict of file clients,
+            refer to
+            https://github.com/open-mmlab/mmcv/blob/master/mmcv/fileio/file_client.py
+            for more details. Defaults to dict(backend='disk').
+    """
+
+    def __init__(self,
+                 coord_type,
+                 load_dim=6,
+                 use_dim=[0, 1, 2],
+                 shift_height=False,
+                 use_color=False,
+                 file_client_args=dict(backend='disk'),
+                 point_type='float32'):
+        self.shift_height = shift_height
+        self.use_color = use_color
+        if isinstance(use_dim, int):
+            use_dim = list(range(use_dim))
+        assert max(use_dim) < load_dim, \
+            f'Expect all used dimensions < {load_dim}, got {use_dim}'
+        assert coord_type in ['CAMERA', 'LIDAR', 'DEPTH']
+
+        self.coord_type = coord_type
+        self.load_dim = load_dim
+        self.use_dim = use_dim
+        self.file_client_args = file_client_args.copy()
+        self.file_client = None
+
+        self.point_type = point_type
+
+    def _load_points(self, pts_filename):
+        """Private function to load point clouds data.
+
+        Args:
+            pts_filename (str): Filename of point clouds data.
+
+        Returns:
+            np.ndarray: An array containing point clouds data.
+        """
+        if self.file_client is None:
+            self.file_client = mmcv.FileClient(**self.file_client_args)
+        try:
+            pts_bytes = self.file_client.get(pts_filename)
+            # NOTE(swc): dtype should be the same with bin file
+            if self.point_type == 'float32':
+                points = np.frombuffer(pts_bytes, dtype=np.float32)
+            elif self.point_type == 'float64':
+                points = np.frombuffer(pts_bytes, dtype=np.float64)
+        except ConnectionError:
+            mmcv.check_file_exist(pts_filename)
+            if pts_filename.endswith('.npy'):
+                points = np.load(pts_filename)
+            else:
+                if self.point_type == 'float32':
+                    points = np.fromfile(pts_filename, dtype=np.float32)
+                elif self.point_type == 'float64':
+                    points = np.fromfile(pts_filename, dtype=np.float64)
+
+        return points
+
+    def __call__(self, results):
+        """Call function to load points data from file.
+
+        Args:
+            results (dict): Result dict containing point clouds data.
+
+        Returns:
+            dict: The result dict containing the point clouds data.
+                Added key and value are described below.
+
+                - points (:obj:`BasePoints`): Point clouds data.
+        """
+        pts_filename = results['pts_filename']
+        points = self._load_points(pts_filename)
+        points = points.reshape(-1, self.load_dim)
+        points = points[:, self.use_dim]
+        attribute_dims = None
+
+        if self.shift_height:
+            floor_height = np.percentile(points[:, 2], 0.99)
+            height = points[:, 2] - floor_height
+            points = np.concatenate(
+                [points[:, :3],
+                 np.expand_dims(height, 1), points[:, 3:]], 1)
+            attribute_dims = dict(height=3)
+
+        if self.use_color:
+            assert len(self.use_dim) >= 6
+            if attribute_dims is None:
+                attribute_dims = dict()
+            attribute_dims.update(
+                dict(color=[
+                    points.shape[1] - 3,
+                    points.shape[1] - 2,
+                    points.shape[1] - 1,
+                ]))
+
+        points_class = get_points_type(self.coord_type)
+        points = points_class(
+            points, points_dim=points.shape[-1], attribute_dims=attribute_dims)
+        results['points'] = points
+
+        return results
+
+    def __repr__(self):
+        """str: Return a string that describes the module."""
+        repr_str = self.__class__.__name__ + '('
+        repr_str += f'shift_height={self.shift_height}, '
+        repr_str += f'use_color={self.use_color}, '
+        repr_str += f'file_client_args={self.file_client_args}, '
+        repr_str += f'load_dim={self.load_dim}, '
+        repr_str += f'use_dim={self.use_dim})'
+        return repr_str
+
+
+
+@PIPELINES.register_module()
+class LoadMultiViewImageFromFiles_Plus(object):
+    """Load multi channel images from a list of separate channel files.
+
+    Expects results['img_filename'] to be a list of filenames.
+
+    Args:
+        to_float32 (bool): Whether to convert the img to float32.
+            Defaults to False.
+        color_type (str): Color type of the file. Defaults to 'unchanged'.
+    """
+
+    def __init__(self, data_config, is_train=False,
+                 sequential=False, aligned=False, trans_only=True):
+        self.is_train = is_train
+        self.data_config = data_config
+        self.normalize_img = torchvision.transforms.Compose((
+            torchvision.transforms.ToTensor(),
+            torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                             std=[0.229, 0.224, 0.225])))
+        self.sequential = sequential
+        self.aligned = aligned
+        self.trans_only = trans_only
+
+    def get_rot(self,h):
+        return torch.Tensor([
+            [np.cos(h), np.sin(h)],
+            [-np.sin(h), np.cos(h)],
+        ])
+
+    def img_transform(self, img, post_rot, post_tran,
+                      resize, resize_dims, crop,
+                      flip, rotate):
+        # adjust image
+        img = self.img_transform_core(img, resize_dims, crop, flip, rotate)
+
+        # post-homography transformation
+        post_rot *= resize
+        post_tran -= torch.Tensor(crop[:2])
+        if flip:
+            A = torch.Tensor([[-1, 0], [0, 1]])
+            b = torch.Tensor([crop[2] - crop[0], 0])
+            post_rot = A.matmul(post_rot)
+            post_tran = A.matmul(post_tran) + b
+        A = self.get_rot(rotate / 180 * np.pi)
+        b = torch.Tensor([crop[2] - crop[0], crop[3] - crop[1]]) / 2
+        b = A.matmul(-b) + b
+        post_rot = A.matmul(post_rot)
+        post_tran = A.matmul(post_tran) + b
+
+        return img, post_rot, post_tran
+
+    def img_transform_core(self, img, resize_dims, crop, flip, rotate):
+        # adjust image
+        img = img.resize(resize_dims)
+        img = img.crop(crop)
+        if flip:
+            img = img.transpose(method=Image.FLIP_LEFT_RIGHT)
+        img = img.rotate(rotate)
+        return img
+
+    def choose_cams(self):
+        if self.is_train and self.data_config['Ncams'] < len(self.data_config['cams']):
+            cams = np.random.choice(self.data_config['cams'], self.data_config['Ncams'],
+                                    replace=False)
+        else:
+            cams = self.data_config['cams']
+        return cams
+
+    def sample_augmentation(self, H , W, flip=None, scale=None):
+        fH, fW = self.data_config['input_size']
+        if self.is_train:
+            resize = float(fW)/float(W)
+            resize += np.random.uniform(*self.data_config['resize'])
+            resize_dims = (int(W * resize), int(H * resize))
+            newW, newH = resize_dims
+            crop_h = int((1 - np.random.uniform(*self.data_config['crop_h'])) * newH) - fH
+            crop_w = int(np.random.uniform(0, max(0, newW - fW)))
+            crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
+            flip = self.data_config['flip'] and np.random.choice([0, 1])
+            rotate = np.random.uniform(*self.data_config['rot'])
+        else:
+            resize = float(fW)/float(W)
+            resize += self.data_config.get('resize_test', 0.0)
+            if scale is not None:
+                resize = scale
+            resize_dims = (int(W * resize), int(H * resize))
+            newW, newH = resize_dims
+            crop_h = int((1 - np.mean(self.data_config['crop_h'])) * newH) - fH
+            crop_w = int(max(0, newW - fW) / 2)
+            crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
+            flip = False if flip is None else flip
+            rotate = 0
+        return resize, resize_dims, crop, flip, rotate
+
+    def get_inputs(self,results, flip=None, scale=None):
+        imgs = []
+        rots = []
+        trans = []
+        intrins = []
+        post_rots = []
+        post_trans = []
+        for idx, filename in enumerate(results['img_info']):
+            lidar2cam = results['lidar2camera'][idx]
+            img = Image.open(filename)
+            
+            if img.height == 960:
+                half_intri =  results['camera_intrinsics'][idx][0:2, 0:3] / 2
+                results['camera_intrinsics'][idx][0:2, 0:3] = half_intri
+                img = img.resize((img.width//2, img.height//2))
+            
+            post_rot = torch.eye(2)
+            post_tran = torch.zeros(2)
+
+            intrin = torch.Tensor(results['camera_intrinsics'][idx])
+            rot = torch.Tensor(lidar2cam[0:3,0:3])
+            tran = torch.Tensor(lidar2cam[0:3,3])
+
+            # augmentation (resize, crop, horizontal flip, rotate)
+            resize, resize_dims, crop, flip, rotate = self.sample_augmentation(H=img.height,
+                                                                               W=img.width,
+                                                                               flip=flip,
+                                                                               scale=scale)
+            img, post_rot2, post_tran2 = self.img_transform(img, post_rot, post_tran,
+                                                            resize=resize,
+                                                            resize_dims=resize_dims,
+                                                            crop=crop,
+                                                            flip=flip,
+                                                            rotate=rotate)
+
+            # for convenience, make augmentation matrices 3x3
+            post_tran = torch.zeros(3)
+            post_rot = torch.eye(3)
+            post_tran[:2] = post_tran2
+            post_rot[:2, :2] = post_rot2
+
+            imgs.append(self.normalize_img(img))
+            intrins.append(intrin)
+            rots.append(rot)
+            trans.append(tran)
+            post_rots.append(post_rot)
+            post_trans.append(post_tran)
+
+        
+        imgs, rots, trans, intrins, post_rots, post_trans = (torch.stack(imgs), torch.stack(rots), torch.stack(trans),
+                                                             torch.stack(intrins), torch.stack(post_rots),
+                                                             torch.stack(post_trans))
+        return imgs, rots, trans, intrins, post_rots, post_trans
+
+    def __call__(self, results):
+        results['img_inputs'] = self.get_inputs(results)
+        return results

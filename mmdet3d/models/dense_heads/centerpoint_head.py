@@ -328,7 +328,7 @@ class CenterHead(BaseModule):
                 in_channels=share_conv_channel, heads=heads, num_cls=num_cls)
             self.task_heads.append(builder.build_head(separate_head))
 
-
+        self.with_velocity = 'vel' in common_heads.keys()
         self.task_specific = task_specific
         self.loss_prefix = loss_prefix
 
@@ -495,8 +495,10 @@ class CenterHead(BaseModule):
                 (len(self.class_names[idx]), feature_map_size[1],
                  feature_map_size[0]))
 
-            anno_box = gt_bboxes_3d.new_zeros((max_objs, 10),
-                                              dtype=torch.float32)
+            if self.with_velocity:
+                anno_box = gt_bboxes_3d.new_zeros((max_objs, 10), dtype=torch.float32)
+            else:
+                anno_box = gt_bboxes_3d.new_zeros((max_objs, 8), dtype=torch.float32)
 
             ind = gt_labels_3d.new_zeros((max_objs), dtype=torch.int64)
             mask = gt_bboxes_3d.new_zeros((max_objs), dtype=torch.uint8)
@@ -553,19 +555,28 @@ class CenterHead(BaseModule):
                     ind[new_idx] = y * feature_map_size[0] + x
                     mask[new_idx] = 1
                     # TODO: support other outdoor dataset
-                    vx, vy = task_boxes[idx][k][7:]
                     rot = task_boxes[idx][k][6]
                     box_dim = task_boxes[idx][k][3:6]
                     if self.norm_bbox:
                         box_dim = box_dim.log()
-                    anno_box[new_idx] = torch.cat([
-                        center - torch.tensor([x, y], device=device),
-                        z.unsqueeze(0), box_dim,
-                        torch.sin(rot).unsqueeze(0),
-                        torch.cos(rot).unsqueeze(0),
-                        vx.unsqueeze(0),
-                        vy.unsqueeze(0)
-                    ])
+                    
+                    if self.with_velocity:
+                        vx, vy = task_boxes[idx][k][7:]
+                        anno_box[new_idx] = torch.cat([
+                            center - torch.tensor([x, y], device=device),
+                            z.unsqueeze(0), box_dim,
+                            torch.sin(rot).unsqueeze(0),
+                            torch.cos(rot).unsqueeze(0),
+                            vx.unsqueeze(0),
+                            vy.unsqueeze(0)
+                        ])
+                    else:
+                        anno_box[new_idx] = torch.cat([
+                            center - torch.tensor([x, y], device=device),
+                            z.unsqueeze(0), box_dim,
+                            torch.sin(rot).unsqueeze(0),
+                            torch.cos(rot).unsqueeze(0)
+                        ])
 
             heatmaps.append(heatmap)
             anno_boxes.append(anno_box)
@@ -599,12 +610,18 @@ class CenterHead(BaseModule):
                 avg_factor=max(num_pos, 1))
             target_box = anno_boxes[task_id]
             # reconstruct the anno_box from multiple reg heads
-            preds_dict[0]['anno_box'] = torch.cat(
-                (preds_dict[0]['reg'], preds_dict[0]['height'],
-                 preds_dict[0]['dim'], preds_dict[0]['rot'],
-                 preds_dict[0]['vel']),
-                dim=1)
-
+            
+            if self.with_velocity:
+                preds_dict[0]['anno_box'] = torch.cat(
+                    (preds_dict[0]['reg'], preds_dict[0]['height'],
+                     preds_dict[0]['dim'], preds_dict[0]['rot'],
+                     preds_dict[0]['vel']),
+                    dim=1)
+            else:
+                preds_dict[0]['anno_box'] = torch.cat(
+                    (preds_dict[0]['reg'], preds_dict[0]['height'],
+                     preds_dict[0]['dim'], preds_dict[0]['rot']),
+                    dim=1)
             # Regression loss for dimension, offset, height, rotation
             ind = inds[task_id]
             num = masks[task_id].float().sum()
@@ -618,8 +635,11 @@ class CenterHead(BaseModule):
             code_weights = self.train_cfg.get('code_weights', None)
             bbox_weights = mask * mask.new_tensor(code_weights)
             if self.task_specific:
-                name_list=['xy','z','whl','yaw','vel']
-                clip_index = [0,2,3,6,8,10]
+                name_list=['xy','z','whl','yaw']
+                clip_index = [0,2,3,6,8]
+                if self.with_velocity:
+                    name_list.append('vel')
+                    clip_index.append(10)
                 for reg_task_id in range(len(name_list)):
                     pred_tmp = pred[...,clip_index[reg_task_id]:clip_index[reg_task_id+1]]
                     target_box_tmp = target_box[...,clip_index[reg_task_id]:clip_index[reg_task_id+1]]
